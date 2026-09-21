@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import math
 import os
 import re
@@ -11,11 +12,16 @@ from typing import Any
 import boto3
 import httpx
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import BotoCoreError, ClientError, ConnectTimeoutError, ReadTimeoutError
 from pyproj import Geod
 
 from app.config import Settings
-from app.exceptions import DemCoverageError, TileDownloadError
+from app.exceptions import (
+    CopernicusConfigurationError,
+    CopernicusTimeoutError,
+    DemCoverageError,
+    TileDownloadError,
+)
 from app.models.cached_tile import CachedTile
 from app.repositories.cached_tiles import CachedTileRepository
 
@@ -36,7 +42,27 @@ RESTRICTED_GEOGRAPHY_MESSAGE = (
 UNAVAILABLE_GEOGRAPHY_MESSAGE = (
     "The geography you have requested is not available from Copernicus GLO-30"
 )
+COPERNICUS_TIMEOUT_MESSAGE = "Copernicus data access timed out. Please try again later"
+COPERNICUS_CONFIGURATION_MESSAGE = (
+    "Copernicus data access is unavailable due to a site configuration problem. "
+    "Please contact the site administrator"
+)
+COPERNICUS_UNAVAILABLE_MESSAGE = (
+    "Copernicus data access is temporarily unavailable. Please try again later"
+)
 MISSING_S3_OBJECT_ERROR_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+S3_AUTH_ERROR_CODES = frozenset(
+    {
+        "AccessDenied",
+        "AuthorizationHeaderMalformed",
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidToken",
+        "SignatureDoesNotMatch",
+    }
+)
+S3_TIMEOUT_ERRORS = (ConnectTimeoutError, ReadTimeoutError)
+logger = logging.getLogger("uvicorn.error")
 
 
 def copernicus_geocell(south: int, west: int) -> str:
@@ -64,23 +90,23 @@ def geocell_center(tile_id: str) -> tuple[float, float]:
     return west + 0.5, south + 0.5
 
 
-def ccm_prefix_for_product(product_name: str) -> str:
-    match = GLO30_PRODUCT_PATTERN.match(product_name)
+def catalogue_grid_id(tile_id: str) -> str:
+    match = GEOCELL_PATTERN.fullmatch(tile_id)
     if match is None:
-        raise ValueError(f"Unsupported GLO-30 product name: {product_name}")
+        raise ValueError(f"Invalid Copernicus geocell: {tile_id}")
     return (
-        "CCM/COP-DEM_GLO-30-DGED/SAR_DGE_30_A4AD/"
-        f"{match.group('year')}/{match.group('month')}/{match.group('day')}/"
-        f"{product_name}_"
+        f"{match.group('latitude_hemisphere')}{match.group('latitude')}_"
+        f"{match.group('longitude_hemisphere')}{match.group('longitude')}"
     )
 
 
-def glo30_product_names(payload: Any) -> list[str]:
+def glo30_product_prefixes(payload: Any) -> list[str]:
     if not isinstance(payload, dict) or not isinstance(payload.get("value"), list):
         raise ValueError("Copernicus catalogue returned an invalid response")
 
-    names: list[str] = []
-    for product in payload["value"]:
+    products = payload["value"]
+    prefixes: list[str] = []
+    for product in products:
         if not isinstance(product, dict):
             continue
         name = product.get("Name")
@@ -91,23 +117,25 @@ def glo30_product_names(payload: Any) -> list[str]:
             and GLO30_PRODUCT_PATTERN.match(name)
             and GLO30_PRODUCT_MARKER in s3_path
         ):
-            names.append(name)
-    return names
+            prefixes.append(s3_path.removeprefix("/eodata/").strip("/"))
+    if products and not prefixes:
+        raise ValueError("Copernicus catalogue returned no usable GLO-30 product paths")
+    return prefixes
 
 
 def find_dem_object(
     s3_client: Any,
     bucket_name: str,
-    product_names: list[str],
+    product_prefixes: list[str],
     tile_id: str,
 ) -> str | None:
     expected_suffix = f"/{tile_id}/DEM/{tile_id}_DEM.tif"
     paginator = s3_client.get_paginator("list_objects_v2")
 
-    for product_name in product_names:
+    for product_prefix in product_prefixes:
         for page in paginator.paginate(
             Bucket=bucket_name,
-            Prefix=ccm_prefix_for_product(product_name),
+            Prefix=f"{product_prefix}/",
         ):
             for item in page.get("Contents", []):
                 object_key = item.get("Key")
@@ -244,9 +272,8 @@ class S3TileService:
         if self.settings.glo30_s3_prefix:
             return object_key_for_geocell(tile_id, self.settings.glo30_s3_prefix)
 
-        longitude, latitude = geocell_center(tile_id)
-        product_names = await self._catalogue_product_names(longitude, latitude)
-        if not product_names:
+        product_prefixes = await self._catalogue_product_prefixes(tile_id)
+        if not product_prefixes:
             raise DemCoverageError(
                 UNAVAILABLE_GEOGRAPHY_MESSAGE,
                 log_detail=f"No GLO-30 catalogue product covers {tile_id}",
@@ -258,33 +285,42 @@ class S3TileService:
                 find_dem_object,
                 s3_client,
                 self.settings.s3_bucket_name,
-                product_names,
+                product_prefixes,
                 tile_id,
             )
         except (BotoCoreError, ClientError) as exc:
-            raise TileDownloadError(f"Unable to search Copernicus S3 for {tile_id}") from exc
+            raise self._s3_access_error(exc, operation="search", tile_id=tile_id) from exc
         if object_key is None:
             raise DemCoverageError(
                 UNAVAILABLE_GEOGRAPHY_MESSAGE,
                 log_detail=f"No GLO-30 DEM object was found for {tile_id}",
             )
+        logger.info("Resolved Copernicus GLO-30 tile %s to S3 object %s", tile_id, object_key)
         return object_key
 
-    async def _catalogue_product_names(
+    async def _catalogue_product_prefixes(
         self,
-        longitude: float,
-        latitude: float,
+        tile_id: str,
     ) -> list[str]:
+        grid_id = catalogue_grid_id(tile_id)
         query_filter = (
-            "Collection/Name eq 'COP-DEM' and "
-            "OData.CSC.Intersects(area=geography'SRID=4326;"
-            f"POINT ({longitude} {latitude})')"
+            "Attributes/OData.CSC.StringAttribute/any(attribute:"
+            "attribute/Name eq 'datasetFull' and "
+            "attribute/OData.CSC.StringAttribute/Value eq 'COP-DEM_GLO-30-DGED') and "
+            "Attributes/OData.CSC.StringAttribute/any(attribute:"
+            "attribute/Name eq 'gridId' and "
+            f"attribute/OData.CSC.StringAttribute/Value eq '{grid_id}')"
         )
         params = {
             "$filter": query_filter,
             "$select": "Name,S3Path",
             "$top": "100",
         }
+        logger.info(
+            "Querying the Copernicus catalogue for GLO-30 tile %s (gridId %s)",
+            tile_id,
+            grid_id,
+        )
         try:
             if self._catalogue_client is not None:
                 response = await self._catalogue_client.get(
@@ -298,12 +334,55 @@ class S3TileService:
                         params=params,
                     )
             response.raise_for_status()
-            return glo30_product_names(response.json())
-        except (httpx.HTTPError, ValueError) as exc:
-            raise TileDownloadError("Unable to query the Copernicus catalogue") from exc
+            product_prefixes = glo30_product_prefixes(response.json())
+        except httpx.TimeoutException as exc:
+            raise CopernicusTimeoutError(
+                COPERNICUS_TIMEOUT_MESSAGE,
+                log_detail=(
+                    f"Copernicus catalogue timed out while resolving {tile_id} "
+                    f"({type(exc).__name__}: {exc})"
+                ),
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if status_code in {401, 403}:
+                raise CopernicusConfigurationError(
+                    COPERNICUS_CONFIGURATION_MESSAGE,
+                    log_detail=(
+                        "Copernicus catalogue rejected access while resolving "
+                        f"{tile_id} (HTTP {status_code})"
+                    ),
+                ) from exc
+            raise TileDownloadError(
+                COPERNICUS_UNAVAILABLE_MESSAGE,
+                log_detail=(
+                    f"Copernicus catalogue returned HTTP {status_code} while resolving {tile_id}"
+                ),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise TileDownloadError(
+                COPERNICUS_UNAVAILABLE_MESSAGE,
+                log_detail=(
+                    f"Copernicus catalogue request failed while resolving {tile_id} "
+                    f"({type(exc).__name__}: {exc})"
+                ),
+            ) from exc
+        except ValueError as exc:
+            raise TileDownloadError(
+                COPERNICUS_UNAVAILABLE_MESSAGE,
+                log_detail=f"Copernicus catalogue returned invalid data for {tile_id}: {exc}",
+            ) from exc
+        logger.info(
+            "Copernicus catalogue returned %d GLO-30 product(s) for tile %s",
+            len(product_prefixes),
+            tile_id,
+        )
+        return product_prefixes
 
     async def _download(self, object_key: str, destination: Path) -> None:
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
+        tile_id = destination.name.removesuffix("_DEM.tif")
+        logger.info("Downloading Copernicus GLO-30 tile %s from S3 object %s", tile_id, object_key)
         try:
             s3_client = await self._get_s3_client()
             await asyncio.to_thread(
@@ -316,18 +395,22 @@ class S3TileService:
             )
         except ClientError as exc:
             if is_missing_s3_object_error(exc):
-                tile_id = destination.name.removesuffix("_DEM.tif")
                 raise DemCoverageError(
                     UNAVAILABLE_GEOGRAPHY_MESSAGE,
                     log_detail=f"No GLO-30 DEM object was found for {tile_id}",
                 ) from exc
+            raise self._s3_access_error(exc, operation="download", tile_id=tile_id) from exc
+        except BotoCoreError as exc:
+            raise self._s3_access_error(exc, operation="download", tile_id=tile_id) from exc
+        except OSError as exc:
             raise TileDownloadError(
-                f"Unable to download GLO-30 tile for {Path(object_key).stem}"
+                COPERNICUS_UNAVAILABLE_MESSAGE,
+                log_detail=(
+                    f"Unable to store Copernicus GLO-30 tile {tile_id} "
+                    f"({type(exc).__name__}: {exc})"
+                ),
             ) from exc
-        except (BotoCoreError, OSError) as exc:
-            raise TileDownloadError(
-                f"Unable to download GLO-30 tile for {Path(object_key).stem}"
-            ) from exc
+        logger.info("Downloaded Copernicus GLO-30 tile %s to %s", tile_id, destination)
 
     async def _remove_expired_tiles(self) -> None:
         now = datetime.now(UTC)
@@ -358,7 +441,10 @@ class S3TileService:
 
     def _create_s3_client(self) -> Any:
         if self.settings.s3_access_key is None or self.settings.s3_secret_key is None:
-            raise TileDownloadError("Copernicus S3 credentials are not configured")
+            raise CopernicusConfigurationError(
+                COPERNICUS_CONFIGURATION_MESSAGE,
+                log_detail="Copernicus S3 credentials are not configured",
+            )
         return boto3.client(
             "s3",
             endpoint_url=self.settings.s3_endpoint_url,
@@ -368,6 +454,46 @@ class S3TileService:
             config=Config(
                 signature_version="s3v4",
                 retries={"max_attempts": 5, "mode": "standard"},
+            ),
+        )
+
+    @staticmethod
+    def _s3_access_error(
+        error: BotoCoreError | ClientError,
+        *,
+        operation: str,
+        tile_id: str,
+    ) -> TileDownloadError | CopernicusTimeoutError | CopernicusConfigurationError:
+        if isinstance(error, S3_TIMEOUT_ERRORS):
+            return CopernicusTimeoutError(
+                COPERNICUS_TIMEOUT_MESSAGE,
+                log_detail=(
+                    f"Copernicus S3 {operation} timed out for {tile_id} "
+                    f"({type(error).__name__}: {error})"
+                ),
+            )
+        if isinstance(error, ClientError):
+            error_details = error.response.get("Error", {})
+            error_code = str(error_details.get("Code", ""))
+            error_message = str(error_details.get("Message", ""))
+            status_code = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            log_context = (
+                f"Copernicus S3 {operation} failed for {tile_id} "
+                f"(HTTP {status_code}, code={error_code}"
+            )
+            if error_code in S3_AUTH_ERROR_CODES or status_code in {401, 403}:
+                return CopernicusConfigurationError(
+                    COPERNICUS_CONFIGURATION_MESSAGE,
+                    log_detail=f"{log_context})",
+                )
+            return TileDownloadError(
+                COPERNICUS_UNAVAILABLE_MESSAGE,
+                log_detail=f"{log_context}, message={error_message})",
+            )
+        return TileDownloadError(
+            COPERNICUS_UNAVAILABLE_MESSAGE,
+            log_detail=(
+                f"Copernicus S3 {operation} failed for {tile_id} ({type(error).__name__}: {error})"
             ),
         )
 
