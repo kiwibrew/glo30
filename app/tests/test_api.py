@@ -5,7 +5,7 @@ import pytest
 from httpx import AsyncClient
 
 from app.dependencies import get_viewshed_service
-from app.exceptions import DemCoverageError
+from app.exceptions import CopernicusConfigurationError, CopernicusTimeoutError, DemCoverageError
 from app.main import app
 from app.models.user import User
 from app.schemas.viewshed import (
@@ -14,6 +14,7 @@ from app.schemas.viewshed import (
     ViewshedProperties,
     ViewshedRequest,
 )
+from app.services.s3_tiles import COPERNICUS_CONFIGURATION_MESSAGE, COPERNICUS_TIMEOUT_MESSAGE
 
 
 class FakeViewshedService:
@@ -67,6 +68,14 @@ class CoverageErrorViewshedService:
 
     async def create(self, _request: ViewshedRequest) -> GeoJSONFeature:
         raise DemCoverageError(self.detail, log_detail=self.log_detail)
+
+
+class CopernicusErrorViewshedService:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def create(self, _request: ViewshedRequest) -> GeoJSONFeature:
+        raise self.error
 
 
 @pytest.mark.asyncio
@@ -132,3 +141,53 @@ async def test_viewshed_coverage_error_is_returned_as_client_error(
         "Application error: POST /api/v1/viewsheds returned 422 "
         f"(DemCoverageError): {detail}; {log_detail}",
     )
+
+
+@pytest.mark.parametrize(
+    ("error", "status_code", "detail", "diagnostic"),
+    [
+        (
+            CopernicusTimeoutError(
+                COPERNICUS_TIMEOUT_MESSAGE,
+                log_detail="Copernicus catalogue timed out (ReadTimeout)",
+            ),
+            504,
+            COPERNICUS_TIMEOUT_MESSAGE,
+            "Copernicus catalogue timed out (ReadTimeout)",
+        ),
+        (
+            CopernicusConfigurationError(
+                COPERNICUS_CONFIGURATION_MESSAGE,
+                log_detail="Copernicus S3 rejected access (HTTP 403, code=InvalidAccessKeyId)",
+            ),
+            502,
+            COPERNICUS_CONFIGURATION_MESSAGE,
+            "Copernicus S3 rejected access (HTTP 403, code=InvalidAccessKeyId)",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_viewshed_copernicus_errors_return_safe_detail_and_explicit_logs(
+    client: AsyncClient,
+    create_test_user: Callable[..., Awaitable[User]],
+    error: Exception,
+    status_code: int,
+    detail: str,
+    diagnostic: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await create_test_user()
+    app.dependency_overrides[get_viewshed_service] = lambda: CopernicusErrorViewshedService(error)
+
+    with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+        response = await client.post(
+            "/api/v1/viewsheds",
+            json=REQUEST_BODY,
+            headers={"Authorization": "Bearer test-bearer-token"},
+        )
+
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
+    assert diagnostic in caplog.record_tuples[-1][2]
+    if isinstance(error, CopernicusConfigurationError):
+        assert "InvalidAccessKeyId" not in response.text

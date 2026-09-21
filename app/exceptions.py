@@ -38,6 +38,14 @@ class DemCoverageError(ApplicationError):
     pass
 
 
+class CopernicusTimeoutError(ApplicationError):
+    pass
+
+
+class CopernicusConfigurationError(ApplicationError):
+    pass
+
+
 class TileDownloadError(ApplicationError):
     pass
 

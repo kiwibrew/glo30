@@ -16,6 +16,8 @@ from app.database import ensure_data_directories
 from app.dependencies import get_current_active_user, get_current_user
 from app.exceptions import (
     ApplicationError,
+    CopernicusConfigurationError,
+    CopernicusTimeoutError,
     DemCoverageError,
     DuplicateUserError,
     InvalidUserOperationError,
@@ -153,6 +155,8 @@ def register_exception_handlers(application: FastAPI) -> None:
         (InvalidUserOperationError, status.HTTP_400_BAD_REQUEST),
         (RadiusLimitError, status.HTTP_422_UNPROCESSABLE_CONTENT),
         (DemCoverageError, status.HTTP_422_UNPROCESSABLE_CONTENT),
+        (CopernicusTimeoutError, status.HTTP_504_GATEWAY_TIMEOUT),
+        (CopernicusConfigurationError, status.HTTP_502_BAD_GATEWAY),
         (TileDownloadError, status.HTTP_502_BAD_GATEWAY),
         (ViewshedProcessingError, status.HTTP_500_INTERNAL_SERVER_ERROR),
     ]
