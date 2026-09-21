@@ -1,32 +1,78 @@
 # Copernicus GLO-30 Viewshed API
 
-This FastAPI service returns a terrain viewshed as a GeoJSON `Feature`. It downloads the
-required Copernicus GLO-30 DGED tiles from the Copernicus Data Space Ecosystem S3 service,
-caches them locally, and performs each calculation in a local metre-based projection.
-The supported runtime is CPython 3.14 in Docker Compose.
-
-## Attribution
+This FastAPI service creates terrain viewsheds from Copernicus GLO-30 DGED elevation data. It returns the visible area as a GeoJSON Feature and includes authenticated Swagger, user administration, and a tile-cache page.
 
 Terrain data produced using Copernicus WorldDEM™-30 © DLR e.V. 2010–2014 and © Airbus Defence and Space GmbH 2014–2018, provided under COPERNICUS by the European Union and ESA; all rights reserved.
 
+## How it Works
+
+The service gets the Copernicus GLO-30 DGED GeoTIFF tiles required for a request. It first finds every one-degree geocell that intersects the requested circle. It uses a locally cached tile when one is available; otherwise, it finds the product through the Copernicus catalogue, downloads the DEM from the Copernicus Data Space Ecosystem S3 service, and records it in the SQLite cache.
+
+All geographic input uses longitude and latitude in WGS 84 coordinates. The service reprojects the required DEM tiles into an Azimuthal Equidistant projection centred on the observer, so it can calculate distances and the output grid in metres.
+
+`POST /api/v1/viewsheds` accepts an observer position, observer and target heights above ground level, and a radius. GDAL calculates the visible cells in the local raster. By default, it accounts for Earth curvature and uses an atmospheric-refraction coefficient of `1/7`.
+
+The service polygonises the visible cells, simplifies the result to a configurable global vertex budget, and transforms it back to WGS 84. The response geometry is a GeoJSON Polygon or MultiPolygon. Its visible area and pixel count are calculated before simplification.
+
+| Library | Use |
+| --- | --- |
+| Boto3 | Find and download Copernicus DGED tiles from S3. |
+| HTTPX | Query the Copernicus catalogue for tile products. |
+| Rasterio | Read, reproject, and polygonise DEM rasters. |
+| GDAL | Calculate the terrain viewshed. |
+| PyProj | Calculate geodesic coverage and create the local metre-based projection. |
+| Shapely | Simplify and transform the output geometry. |
+
+## Run the service
+
+Docker Compose is the only supported application environment. CPython and all application tools run in the `app` container.
+
+1. Copy `docker-compose.yml.example` to `docker-compose.yml`.
+2. Copy `.env.example` to `.env`.
+3. Set valid Copernicus Data Space Ecosystem S3 credentials and replace `secret_key` with a long, random value. Set `cookie_secure=true` for production HTTPS.
+4. Build and start the service:
+
+```bash
+docker compose up --build
+```
+
+5. Create the first administrator:
+
+```bash
+docker compose run --rm app python manage_users.py create admin@example.com 'a-long-password'
+```
+
+The application is available at <http://localhost:8004>. The SQLite database and downloaded DEM tiles remain in the `glo30-data` Docker volume.
+
+Do not install Python packages or run Python tools on the host. Declare dependencies in the repository, then rebuild the image.
 
 ## API
 
-`POST /api/v1/viewsheds` requires a bearer token and a JSON body:
+All application endpoints use the `/api/v1` prefix and require an active account:
 
-```json
-{
-  "observer_coordinates": [174.2316077, -39.0035668],
-  "observer_height_agl_m": 30,
-  "target_height_agl_m": 0,
-  "radius_m": 10000
-}
+| Method | Endpoint | Input | Result |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/health` | None | Service health response. |
+| `POST` | `/api/v1/viewsheds` | Observer, heights, and radius JSON body. | A visible-area GeoJSON Feature. |
+
+For example:
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8004/api/v1/viewsheds \
+  --data '{
+    "observer_coordinates": [174.2316077, -39.0035668],
+    "observer_height_agl_m": 30,
+    "target_height_agl_m": 0,
+    "radius_m": 10000
+  }'
 ```
 
-Coordinates use GeoJSON order: `[longitude, latitude]`. Heights and radius are metres. The
-default maximum radius is 100,000 m and can be reduced with `max_radius_m`.
+`observer_coordinates` uses GeoJSON order: `[longitude, latitude]`. Heights and radius are metres. Observer and target heights must be from `0` through `10,000` metres. The radius must be greater than `0` and no greater than `max_radius_m`, which defaults to `100,000` metres.
 
-The response is a GeoJSON Polygon or MultiPolygon:
+The response has this shape:
 
 ```json
 {
@@ -50,28 +96,13 @@ The response is a GeoJSON Polygon or MultiPolygon:
 }
 ```
 
-The visible area and pixel count are calculated from the binary 30 m raster before geometry
-simplification. By default, the output geometry budget is
-`ceil(visible_area_sq_km × geometry_vertices_per_sq_km)` vertices, clamped between the
-`geometry_min_vertex_budget` floor and `geometry_max_vertex_budget` ceiling. Small components may
-collapse during simplification when that is necessary to meet the budget.
+Send API credentials in `Authorization: Bearer TOKEN`. The application tries a persistent token first, then accepts an access-type JWT from `POST /token`. Inactive accounts receive HTTP 403.
 
 ### Error handling
 
-A valid request whose required DEM tile is unavailable is reported as `422 Unprocessable Entity`,
-not as an upstream gateway failure. This allows API clients, including clients reaching the service
-through Cloudflare, to receive the application response instead of a proxy-generated `502` page.
+The API reports a valid request whose required DEM tile is unavailable as HTTP 422, rather than an upstream gateway error. This lets clients receive the application response instead of a proxy-generated 502 page.
 
-If a request intersects a tile known to be withheld from public distribution, the response is:
-
-```json
-{
-  "detail": "The geography you have requested is not yet released to the public. Please visit https://sentinels.copernicus.eu/-/copernicus-dem-30-metre-dataset-now-freely-available for more information"
-}
-```
-
-If Copernicus has no GLO-30 catalogue product or DEM object for a tile that is not on the known
-restricted list, the response is:
+A request that intersects a geocell withheld from public distribution receives HTTP 422 with an explanation that the geography is not yet released. A tile that is not restricted but has no Copernicus catalogue product or DEM object also receives HTTP 422:
 
 ```json
 {
@@ -79,173 +110,77 @@ restricted list, the response is:
 }
 ```
 
-Actual failures while contacting the Copernicus catalogue or S3 service remain `502 Bad Gateway`
-responses. Internal viewshed-processing failures remain `500 Internal Server Error` responses.
-Handled application errors are also written to the Uvicorn error log with the request method, path,
-status, exception type, and internal diagnostic context. For example:
+Actual Copernicus catalogue or S3 failures receive HTTP 502. Viewshed-processing failures receive HTTP 500. The configured `glo30_restricted_tile_ids` list contains the known unavailable geocells.
 
-```text
-WARNING: Application error: POST /api/v1/viewsheds returned 422 (DemCoverageError): The geography you have requested is not available from Copernicus GLO-30; No GLO-30 catalogue product covers Copernicus_DSM_10_S40_00_E174_00
-```
+## Configuration
 
-True `5xx` application errors include a traceback in the origin log.
+Copy `.env.example` to `.env`. Change values there, then restart the app container. `app/config.py` defines the settings, types, validation, and defaults. Environment variables override those defaults.
 
-#### Known unavailable tiles
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `DATABASE_URL` | `sqlite+aiosqlite:////app/data/app.db` | SQLAlchemy database connection URL. |
+| `TILE_CACHE_DIR` | `/app/data/tiles` | Directory for downloaded DGED GeoTIFF tiles. |
+| `TILE_CACHE_EXPIRY_DAYS` | `30` | Days before an unused cached tile expires. |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | Required | Copernicus Data Space Ecosystem S3 credentials. |
+| `S3_HOST_BASE` | `eodata.dataspace.copernicus.eu` | Copernicus S3 endpoint host. |
+| `S3_BUCKET_NAME` | `eodata` | Copernicus S3 bucket name. |
+| `GLO30_S3_PREFIX` | Empty | Optional direct S3 prefix that bypasses catalogue discovery. |
+| `MAX_RADIUS_M` | `100000` | Largest accepted viewshed radius in metres. |
+| `DEM_RESOLUTION_M` | `30` | Working-raster cell size in metres. |
+| `DEM_RESAMPLING_METHOD` | `bilinear` | Elevation interpolation for the working grid. |
+| `GEOMETRY_VERTICES_PER_SQ_KM` | `100` | Vertex budget density for the output geometry. |
+| `GEOMETRY_MIN_VERTEX_BUDGET` | `8` | Smallest global geometry vertex budget. |
+| `GEOMETRY_MAX_VERTEX_BUDGET` | `10000` | Largest global geometry vertex budget. |
+| `SECRET_KEY` | Required | Secret used to sign JWTs and CSRF tokens. Use a long random value. |
+| `COOKIE_SECURE` | `false` | Send cookies only over HTTPS when `true`. |
+| `SMTP_ENABLED` | `false` | Enable password-reset email delivery. |
+| `SMTP_HOST` / `SMTP_FROM` | Empty | Required SMTP host and sender when email is enabled. |
 
-The default `glo30_restricted_tile_ids` setting contains the following 25 unique geocells, covering
-parts of Armenia and Azerbaijan. Requests whose radius intersects any of these tiles receive the
-"not yet released to the public" response above. The compact code `N40E044`, for example,
-corresponds to the full Copernicus identifier `Copernicus_DSM_10_N40_00_E044_00`.
-
-- `N38E045`
-- `N38E046`
-- `N38E048`
-- `N38E049`
-- `N39E044`
-- `N39E045`
-- `N39E046`
-- `N39E047`
-- `N39E048`
-- `N39E049`
-- `N40E043`
-- `N40E044`
-- `N40E045`
-- `N40E046`
-- `N40E047`
-- `N40E048`
-- `N40E049`
-- `N40E050`
-- `N41E043`
-- `N41E044`
-- `N41E045`
-- `N41E046`
-- `N41E047`
-- `N41E048`
-- `N41E049`
-
-### Output shape tuning
-
-All tuning values are environment-backed settings documented beside their defaults in
-`app/config.py`. The most useful controls are:
-
-- `geometry_vertices_per_sq_km` (default `100`): increase this first to retain more curved edges
-  and detail. It controls a global budget shared by all polygons and holes.
-- `geometry_min_vertex_budget` (default `8`): raises the budget only for very small total visible
-  areas; it is not a per-polygon minimum.
-- `geometry_max_vertex_budget` (default `10000`): caps geometry complexity and response size for
-  large visible areas.
-- `dem_resolution_m` (default `30`): lower values create a finer working raster at substantially
-  greater memory and compute cost. Values below GLO-30's native detail interpolate the source.
-- `dem_resampling_method` (default `bilinear`): controls elevation interpolation onto that grid.
-- `geometry_polygon_connectivity` and `geometry_simplification_preserve_topology`: control how
-  diagonal cells, components, and holes survive polygonisation and simplification.
-
-The remaining simplification search controls are normally left at their defaults. The
-`coverage_boundary_sample_interval_degrees` setting only identifies source tiles and does not
-change output polygon detail.
-
-
-## Viewshed method
-
-For every request the service:
-
-1. Samples the requested circle at the configured coverage-boundary interval, constructs its
-   geodesic bounds, and identifies all intersecting one-degree GLO-30 geocells.
-2. Downloads missing DGED GeoTIFFs from S3 and records them in the SQLite tile cache.
-3. Reprojects the required data into an Azimuthal Equidistant CRS centred on the observer,
-   using the configured output grid (30 m by default).
-4. Runs GDAL `gdal_viewshed` with the requested observer and target heights and maximum distance.
-5. Applies Earth curvature using GDAL curvature coefficient `1 - 1/7`; the corresponding
-   atmospheric refraction coefficient is `1/7`.
-6. Polygonises visible cells, simplifies to the vertex budget, and transforms the result to
-   EPSG:4326.
-
-By default, the service locates each uncached geocell through the Copernicus catalogue, resolves
-the corresponding object below the live `CCM/COP-DEM_GLO-30-DGED` S3 hierarchy, and stores the
-resolved object key in SQLite. A deployment with a stable direct geocell hierarchy can bypass
-catalogue discovery by setting `glo30_s3_prefix`; that prefix must use this layout:
+`GLO30_S3_PREFIX` must use this direct-geocell layout:
 
 ```text
 <glo30_s3_prefix>/
   Copernicus_DSM_10_<geocell>/DEM/Copernicus_DSM_10_<geocell>_DEM.tif
 ```
 
-## Authentication and users
+Lower `DEM_RESOLUTION_M` values make a finer working raster, with substantially greater memory and compute cost. Values below GLO-30's native detail interpolate existing terrain rather than adding measurements. Increase `GEOMETRY_VERTICES_PER_SQ_KM` to retain more curved edges and output detail. The complete output-shape controls are documented with their defaults in `app/config.py`.
 
-- Administrators sign into the web UI with email and password.
-- Administrators create, activate, promote, and remove users at `/manage-users`.
-- Each non-admin user receives a persistent bearer token. An administrator can regenerate it.
-- JWT cookies authenticate web sessions. Persistent user tokens authenticate API requests.
-- Users can request a 30-minute, single-use password-reset code from `/forgot-password`.
-- Every active user can inspect the current GLO-30 tile inventory at `/tile-cache`.
-- `/docs` and `/openapi.json` are available only after sign-in. Swagger is pre-authorised with
-  the signed-in regular user's bearer token.
+Running the service requires a Copernicus Data Space Ecosystem account registered for Copernicus Contributing Missions access. Generate S3 credentials through the Copernicus Data Space Ecosystem portal.
 
-Create the first administrator inside the Compose service:
+## Authentication and UI
+
+Open `/` and sign in with an administrator account. Authenticated users can access these pages:
+
+- `/docs` for Swagger
+- `/app-docs` for this guide
+- `/manage-users` for their visible account information
+- `/tile-cache` for the current GLO-30 tile inventory
+
+Administrators manage users. API users get a random persistent bearer token; administrators never get one. `/token` exchanges a valid email and password for a short-lived JWT. Browser sessions use a separate typed JWT in an HTTP-only cookie.
+
+Use `/forgot-password` to request a reset code. When SMTP delivery is enabled, the service emails a one-time code. The code expires after 30 minutes. Paste it into `/reset-password`. The acknowledgement is the same whether or not an eligible account exists.
+
+## Database and first administrator
+
+The container applies Alembic migrations when it starts. Use these commands for explicit migration work:
 
 ```bash
 docker compose run --rm app alembic upgrade head
-docker compose run --rm app python manage_users.py create admin@example.com 'change-this-password'
+docker compose run --rm app alembic revision --autogenerate -m "description"
 ```
 
-Remove a user:
+Create or remove an account with the user-management command:
 
 ```bash
+docker compose run --rm app python manage_users.py create admin@example.com 'a-long-password'
 docker compose run --rm app python manage_users.py remove user@example.com
 ```
 
-## Configuration
+The command does not print a password, password hash, JWT, or persistent token.
 
-Copy the supplied examples to the untracked deployment files:
+## Checks
 
-```text
-docker-compose.yml.example -> docker-compose.yml
-.env.example               -> .env
-```
-
-The existing `.env` names are supported directly by `app/config.py`:
-
-```dotenv
-s3_access_key = ...
-s3_secret_key = ...
-s3_host_base = eodata.dataspace.copernicus.eu
-s3_host_bucket = eodata.dataspace.copernicus.eu
-secret_key = a-long-random-deployment-secret
-cookie_secure = true
-smtp_enabled = true
-smtp_host = mail.example.com
-smtp_port = 25
-smtp_from = no-reply@example.com
-```
-
-Password-reset email is disabled by default. When enabled, the application sends reset codes over
-SMTP without blocking the async request loop. It does not store the plain reset code.
-
-`s3_host_bucket` is retained for compatibility with the supplied configuration; the actual S3
-bucket name defaults to `eodata` and can be changed with `s3_bucket_name`.
-
-s3 access and secret keys are provided by Compernicus.
-
-Running the application requires a Copernicus Data Space Ecosystem (CDSE) account that is registered for Copernicus Contributing Missions (CCM) access. Account holders may generate s3 credentials through the Copernicus Data Portal. The application downloads and caches the required terrain tiles using the authenticated CDSE APIs. Information on registering for CCM access and the available download interfaces (Copernicus Browser, OData and S3) is available from the Copernicus Data Space Ecosystem documentation.
-
-## Docker Compose operation
-
-The application and all development tools run only through Docker Compose.
-
-```bash
-docker compose up --build
-```
-
-The service listens on `http://localhost:8004`. The Compose command applies migrations before
-starting Uvicorn.
-
-Run migrations explicitly:
-
-```bash
-docker compose run --rm app alembic upgrade head
-```
-
-Run verification:
+Run every check through Compose:
 
 ```bash
 docker compose run --rm app pytest
@@ -255,10 +190,9 @@ docker compose run --rm app ruff format --check .
 docker compose run --rm app mypy app/
 ```
 
-Cached DEM files and the SQLite database are stored in the `glo30-data` volume. The default cache
-expiry is 30 days from last use.
+Tests use a separate SQLite database. Rollback transactions isolate database changes.
 
-## Project layout
+## Structure
 
 ```text
 app/
@@ -271,12 +205,14 @@ app/
 ├── routers/
 ├── services/
 ├── repositories/
-├── templates/
-└── tests/
+└── templates/
+tests/
+├── conftest.py
+├── test_routers/
+└── test_services/
 migrations/
-Dockerfile
-docker-compose.yml.example
 ```
+
 ## Citation
 
 Copernicus DEM GLO-30 (DGED). European Space Agency (ESA) and the Copernicus Programme. Digital Surface Model (DSM), 30 m global resolution. DOI: 10.5270/ESA-c5d3d65.
